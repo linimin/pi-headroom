@@ -432,11 +432,45 @@ function activeStatusLine(model: ProviderModel | undefined): string {
   return `Headroom:${provider} ${status}${fallback}${perfSuffix}`;
 }
 
-function updateUiStatus(
+function isStaleCtxError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    error.message.includes(
+      "This extension ctx is stale after session replacement or reload",
+    )
+  );
+}
+
+function currentModelOrUndefined(ctx: ExtensionCtx): ProviderModel | undefined {
+  try {
+    return ctx.model;
+  } catch (error) {
+    if (isStaleCtxError(error)) return undefined;
+    throw error;
+  }
+}
+
+function notifyUi(
   ctx: ExtensionCtx,
-  model: ProviderModel | undefined = ctx.model,
+  message: string,
+  level: "info" | "warn" | "error",
 ): void {
-  ctx.ui.setStatus?.(STATUS_SLOT, activeStatusLine(model));
+  try {
+    ctx.ui.notify(message, level);
+  } catch (error) {
+    if (isStaleCtxError(error)) return;
+    throw error;
+  }
+}
+
+function updateUiStatus(ctx: ExtensionCtx, model?: ProviderModel): void {
+  try {
+    const resolvedModel = model ?? currentModelOrUndefined(ctx);
+    ctx.ui.setStatus?.(STATUS_SLOT, activeStatusLine(resolvedModel));
+  } catch (error) {
+    if (isStaleCtxError(error)) return;
+    throw error;
+  }
 }
 
 function statusLines(model: ProviderModel | undefined): string[] {
@@ -511,17 +545,18 @@ function detectHeadroomInstallProblem(): string | undefined {
 
 function notifyHeadroomUnavailable(
   ctx: ExtensionCtx,
-  model: ProviderModel | undefined = ctx.model,
+  model?: ProviderModel,
   opts: { once?: boolean } = {},
 ): void {
-  const provider = managedProviderFor(model);
+  const provider = managedProviderFor(model ?? currentModelOrUndefined(ctx));
   if (!provider || !headroomInstallProblem) return;
 
   const state = globalState();
   if (opts.once && state.installWarningShown) return;
   if (opts.once) state.installWarningShown = true;
 
-  ctx.ui.notify(
+  notifyUi(
+    ctx,
     `Headroom unavailable for ${provider}; using pi defaults. ${headroomInstallProblem}`,
     "warn",
   );
@@ -931,7 +966,8 @@ function warmInBackground(
       await refreshPerfSummary(provider);
       updateUiStatus(ctx, model);
       if (VERBOSE) {
-        ctx.ui.notify(
+        notifyUi(
+          ctx,
           `Headroom proxy ready for ${provider} (${source})`,
           "info",
         );
@@ -939,7 +975,8 @@ function warmInBackground(
     })
     .catch((error) => {
       updateUiStatus(ctx, model);
-      ctx.ui.notify(
+      notifyUi(
+        ctx,
         `Headroom background start failed for ${provider}: ${error instanceof Error ? error.message : String(error)}`,
         "error",
       );
@@ -987,12 +1024,13 @@ function registerCommands(pi: ExtensionAPI): void {
       await Promise.all(
         providerIds().map((provider) => resolveKnownState(provider)),
       );
-      const activeProvider = managedProviderFor(ctx.model);
+      const model = currentModelOrUndefined(ctx);
+      const activeProvider = managedProviderFor(model);
       if (activeProvider) {
         await refreshPerfSummary(activeProvider, { fresh: true });
       }
-      updateUiStatus(ctx);
-      ctx.ui.notify(statusLines(ctx.model).join("\n"), "info");
+      updateUiStatus(ctx, model);
+      notifyUi(ctx, statusLines(model).join("\n"), "info");
     },
   });
 
@@ -1002,16 +1040,8 @@ function registerCommands(pi: ExtensionAPI): void {
     handler: async (args: string, ctx: ExtensionCtx) => {
       if (headroomInstallProblem) {
         updateUiStatus(ctx);
-        ctx.ui.notify(
-          `Headroom unavailable; managed providers are using pi defaults. ${headroomInstallProblem}`,
-          "warn",
-        );
-        return;
-      }
-
-      if (headroomInstallProblem) {
-        updateUiStatus(ctx);
-        ctx.ui.notify(
+        notifyUi(
+          ctx,
           `Headroom unavailable; managed providers are using pi defaults. ${headroomInstallProblem}`,
           "warn",
         );
@@ -1021,7 +1051,8 @@ function registerCommands(pi: ExtensionAPI): void {
       const selected = parseProviderArg(args);
       if (args.trim() && !selected) {
         const known = [...providerIds(), "all"].join(", ");
-        ctx.ui.notify(
+        notifyUi(
+          ctx,
           `Unknown provider ${JSON.stringify(args.trim())}. Use ${known}.`,
           "error",
         );
@@ -1042,7 +1073,8 @@ function registerCommands(pi: ExtensionAPI): void {
       }
 
       updateUiStatus(ctx);
-      ctx.ui.notify(
+      notifyUi(
+        ctx,
         stopped.length
           ? `Stopped Headroom proxy for ${stopped.join(", ")}.`
           : "No extension-owned Headroom proxy to stop.",
@@ -1057,7 +1089,8 @@ function registerCommands(pi: ExtensionAPI): void {
     handler: async (args: string, ctx: ExtensionCtx) => {
       if (headroomInstallProblem) {
         updateUiStatus(ctx);
-        ctx.ui.notify(
+        notifyUi(
+          ctx,
           `Headroom unavailable; managed providers are using pi defaults. ${headroomInstallProblem}`,
           "warn",
         );
@@ -1067,7 +1100,8 @@ function registerCommands(pi: ExtensionAPI): void {
       const selected = parseProviderArg(args);
       if (args.trim() && !selected) {
         const known = [...providerIds(), "all"].join(", ");
-        ctx.ui.notify(
+        notifyUi(
+          ctx,
           `Unknown provider ${JSON.stringify(args.trim())}. Use ${known}.`,
           "error",
         );
@@ -1088,7 +1122,8 @@ function registerCommands(pi: ExtensionAPI): void {
       }
 
       updateUiStatus(ctx);
-      ctx.ui.notify(
+      notifyUi(
+        ctx,
         `Restarted Headroom proxy for ${providers.join(", ")}.`,
         "info",
       );
@@ -1130,17 +1165,19 @@ export default async function headroomProviderSupervisor(
       updateUiStatus(ctx);
       return;
     }
+    const model = currentModelOrUndefined(ctx);
     try {
-      updateUiStatus(ctx);
-      await ensureForCurrentModel(ctx.model);
-      const provider = managedProviderFor(ctx.model);
+      updateUiStatus(ctx, model);
+      await ensureForCurrentModel(model);
+      const provider = managedProviderFor(model);
       if (provider) {
         await refreshPerfSummary(provider);
       }
-      updateUiStatus(ctx);
+      updateUiStatus(ctx, model);
     } catch (error) {
-      updateUiStatus(ctx);
-      ctx.ui.notify(
+      updateUiStatus(ctx, model);
+      notifyUi(
+        ctx,
         `Headroom route unavailable: ${error instanceof Error ? error.message : String(error)}`,
         "error",
       );
@@ -1154,14 +1191,15 @@ export default async function headroomProviderSupervisor(
       return;
     }
 
-    const provider = managedProviderFor(ctx.model);
+    const model = currentModelOrUndefined(ctx);
+    const provider = managedProviderFor(model);
     if (!provider) {
-      updateUiStatus(ctx);
+      updateUiStatus(ctx, model);
       return;
     }
 
     await refreshPerfSummary(provider, { fresh: true });
-    updateUiStatus(ctx);
+    updateUiStatus(ctx, model);
   });
 
   pi.on("session_shutdown", async (event: SessionShutdownEvent) => {
