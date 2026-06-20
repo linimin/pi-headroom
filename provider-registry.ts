@@ -1,5 +1,8 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { githubCopilotOAuthProvider } from "@earendil-works/pi-ai/oauth";
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 const MANAGED_PROVIDERS = [
   "xai",
@@ -83,6 +86,23 @@ interface SimpleProviderSpecOptions {
   defaultUpstream: string;
   routedBaseStyle: RoutedBaseStyle;
   extraEnv?: Record<string, string>;
+}
+
+function readPiCopilotAccessToken(): string | undefined {
+  const configDir =
+    process.env.PI_CODING_AGENT_DIR?.trim() || join(homedir(), ".pi", "agent");
+
+  try {
+    const payload = JSON.parse(
+      readFileSync(join(configDir, "auth.json"), "utf8"),
+    ) as {
+      [provider: string]: { access?: unknown } | undefined;
+    };
+    const token = payload["github-copilot"]?.access;
+    return typeof token === "string" && token.trim() ? token.trim() : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function parsePositiveInt(raw: string | undefined, fallback: number): number {
@@ -186,13 +206,17 @@ const PROVIDER_SPECS: Record<ManagedProvider, ManagedProviderSpec> = {
     preferredPortEnv: "PI_HEADROOM_COPILOT_PORT",
     defaultPreferredPort: 8788,
     buildProxyEnv() {
+      const accessToken =
+        process.env.GITHUB_COPILOT_API_TOKEN?.trim() || readPiCopilotAccessToken();
+
       return {
         HEADROOM_BACKEND: "openai",
         OPENAI_TARGET_API_URL:
           process.env.PI_HEADROOM_COPILOT_UPSTREAM?.trim() ||
           "https://api.githubcopilot.com",
         GITHUB_COPILOT_USE_TOKEN_EXCHANGE:
-          process.env.PI_HEADROOM_COPILOT_USE_TOKEN_EXCHANGE?.trim() || "1",
+          process.env.PI_HEADROOM_COPILOT_USE_TOKEN_EXCHANGE?.trim() || "0",
+        ...(accessToken ? { GITHUB_COPILOT_API_TOKEN: accessToken } : {}),
         LITELLM_SUPPRESS_DEBUG_INFO: "True",
       };
     },

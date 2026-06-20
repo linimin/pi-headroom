@@ -104,6 +104,8 @@ Then edit `.env` if you want to point a provider at a different upstream.
 
 For `github-copilot` in Docker, prefer setting an explicit `GITHUB_COPILOT_TOKEN` or `GITHUB_COPILOT_GITHUB_TOKEN` in `.env`. Docker containers generally cannot reuse your host keychain/session auth the same way local host processes can.
 
+For `github-copilot` on Business seats, prefer starting the proxy through `/headroom-start github-copilot` or otherwise ensure the proxy process has a current `GITHUB_COPILOT_API_TOKEN`. Reusing a host OAuth token through Headroom token exchange can downgrade the available model set for the proxy process.
+
 ## Enable / use
 
 1. Open pi.
