@@ -26,8 +26,8 @@ When you choose a supported provider in pi, this extension:
 
 - overrides that provider's `baseUrl` to a local Headroom proxy,
 - starts the proxy automatically if it is not already running,
-- keeps the proxy running across pi sessions by default,
-- reuses an already-running external Headroom proxy if one exists,
+- runs one shared managed proxy per provider across pi sessions and agent processes,
+- does not attach to arbitrary external Headroom proxies,
 - shows proxy status in the pi footer,
 - shows dashboard URLs and routing details in `/headroom-status`.
 
@@ -190,18 +190,18 @@ Show:
 
 ### `/headroom-stop [provider|all]`
 
-Stop extension-owned Headroom proxies.
+Stop managed Headroom provider proxies.
 
 ### `/headroom-restart [provider|all]`
 
-Restart extension-owned Headroom proxies.
+Restart managed Headroom provider proxies.
 
 ## Footer status
 
 The extension shows a lightweight status line in pi, for example:
 
 ```text
-Headroom:openai running/own | hist saved 33.0M | $83.3 | 36%
+Headroom:openai running | hist saved 33.0M | $83.3 | 36%
 ```
 
 ## Important behavior
@@ -209,21 +209,24 @@ Headroom:openai running/own | hist saved 33.0M | $83.3 | 36%
 - **Supported providers** are routed through Headroom.
 - **Unsupported providers** fall back to normal pi behavior.
 - If Headroom is missing, the extension warns and does **not** block normal pi usage.
-- By default, proxies are **sticky**: they keep running across pi sessions.
-- Footer perf numbers prefer Headroom Historical Proxy Compression data (`/stats-history` lifetime stats, with `/stats` fallback), so they survive proxy restarts better than per-process runtime counters.
+- By default, each provider uses one shared managed proxy that stays available across pi sessions and agent processes.
+- Proxy startup is serialized across processes so one provider converges on one managed proxy.
+- If a managed provider proxy becomes unhealthy, the extension automatically stops and restarts it on demand.
+- Footer perf numbers prefer Headroom Historical Proxy Compression data (`/stats-history` lifetime stats, `/stats` fallback), so they survive proxy restarts better than per-process runtime counters.
 - GitHub Copilot keeps pi's built-in OAuth flow and re-routes the final base URL through Headroom.
 
-## Useful environment variables
+## Useful environment
 
 Common ones:
 
 - `PI_HEADROOM_BIN`
 - `PI_HEADROOM_HOST`
 - `PI_HEADROOM_AUTOSTART`
-- `PI_HEADROOM_SHUTDOWN_MODE` (`sticky` default, `session` optional)
 - `PI_HEADROOM_VERBOSE`
 - `PI_HEADROOM_PORT_SCAN_LIMIT`
 - `PI_HEADROOM_STATE_DIR`
+- `PI_HEADROOM_START_LOCK_WAIT_MS`
+- `PI_HEADROOM_START_LOCK_STALE_MS`
 
 Each provider also has optional port/upstream overrides such as:
 
