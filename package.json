@@ -1,0 +1,36 @@
+{
+  "name": "@linimin/pi-headroom",
+  "version": "0.1.0",
+  "description": "Pi package that routes selected providers through local Headroom proxies with auto-start and status UI.",
+  "type": "module",
+  "license": "MIT",
+  "author": "linimin",
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "index.ts",
+    "provider-registry.ts",
+    "README.md",
+    "LICENSE",
+    "headroom-provider-supervisor.ts",
+    "headroom-provider-supervisor.README.md",
+    "package.json"
+  ],
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "headroom",
+    "pi",
+    "llm-proxy"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}
