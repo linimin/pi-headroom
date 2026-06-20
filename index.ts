@@ -19,10 +19,8 @@ type StatusLevel =
   | "idle"
   | "starting"
   | "running"
-  | "external"
   | "failed"
   | "stopped";
-type ShutdownMode = "sticky" | "session";
 type UiLevel = "info" | "warn" | "error" | "success";
 type PortDisposition = "headroom" | "free" | "occupied";
 
@@ -35,14 +33,12 @@ type ExtensionCtx = {
 };
 
 type ModelSelectEvent = { model?: ProviderModel };
-type SessionShutdownEvent = { reason?: string };
 
 interface ManagedProxyState {
   provider: ManagedProvider;
   port: number;
   rootUrl: string;
   routedBaseUrl: string;
-  owned: boolean;
   pid?: number;
   process?: ChildProcess;
   status: StatusLevel;
@@ -58,11 +54,19 @@ interface RouteMetadata {
   version: number;
 }
 
-interface OwnerMetadata {
+interface ServiceMetadata {
   provider: ManagedProvider;
   pid: number;
   port: number;
   startedAt: string;
+  version: number;
+}
+
+interface StartLockMetadata {
+  provider: ManagedProvider;
+  pid: number;
+  token: string;
+  acquiredAt: string;
   version: number;
 }
 
@@ -83,8 +87,6 @@ interface SupervisorState {
   proxies: Map<ManagedProvider, ManagedProxyState>;
   pending: Map<ManagedProvider, Promise<ManagedProxyState>>;
   perf: Map<ManagedProvider, PerfSummary>;
-  cleanupInstalled: boolean;
-  cleaningUp: boolean;
   installWarningShown: boolean;
 }
 
@@ -100,7 +102,6 @@ const RESTART_COMMAND =
   process.env.PI_HEADROOM_RESTART_COMMAND?.trim() || "headroom-restart";
 const VERBOSE = isEnabled(process.env.PI_HEADROOM_VERBOSE);
 const AUTOSTART = isDefaultEnabled(process.env.PI_HEADROOM_AUTOSTART, true);
-const SHUTDOWN_MODE = parseShutdownMode(process.env.PI_HEADROOM_SHUTDOWN_MODE);
 const PROBE_TIMEOUT_MS = parsePositiveInt(
   process.env.PI_HEADROOM_PROBE_TIMEOUT_MS,
   1500,
@@ -124,6 +125,14 @@ const PORT_SCAN_LIMIT = parsePositiveInt(
 const STATE_DIR =
   process.env.PI_HEADROOM_STATE_DIR?.trim() ||
   join(homedir(), ".headroom", "pi-supervisor");
+const START_LOCK_WAIT_MS = parsePositiveInt(
+  process.env.PI_HEADROOM_START_LOCK_WAIT_MS,
+  START_TIMEOUT_MS + 5000,
+);
+const START_LOCK_STALE_MS = parsePositiveInt(
+  process.env.PI_HEADROOM_START_LOCK_STALE_MS,
+  Math.max(START_TIMEOUT_MS * 2, 60_000),
+);
 
 let resolvedConfigs: Record<ManagedProvider, ManagedProxyConfig> | undefined;
 let initPromise:
@@ -146,16 +155,17 @@ function parsePositiveInt(raw: string | undefined, fallback: number): number {
   return Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
-function parseShutdownMode(raw: string | undefined): ShutdownMode {
-  return raw?.trim().toLowerCase() === "session" ? "session" : "sticky";
-}
 
 function routeMetadataPath(provider: ManagedProvider): string {
   return join(STATE_DIR, "routes", `${provider}.json`);
 }
 
-function ownerMetadataPath(provider: ManagedProvider): string {
-  return join(STATE_DIR, "owners", `${provider}.json`);
+function serviceMetadataPath(provider: ManagedProvider): string {
+  return join(STATE_DIR, "services", `${provider}.json`);
+}
+
+function startLockPath(provider: ManagedProvider): string {
+  return join(STATE_DIR, "locks", `${provider}.json`);
 }
 
 function globalState(): SupervisorState {
@@ -170,9 +180,6 @@ function globalState(): SupervisorState {
   if (!(state.proxies instanceof Map)) state.proxies = new Map();
   if (!(state.pending instanceof Map)) state.pending = new Map();
   if (!(state.perf instanceof Map)) state.perf = new Map();
-  if (typeof state.cleanupInstalled !== "boolean")
-    state.cleanupInstalled = false;
-  if (typeof state.cleaningUp !== "boolean") state.cleaningUp = false;
   if (typeof state.installWarningShown !== "boolean")
     state.installWarningShown = false;
 
@@ -189,17 +196,13 @@ function processAlive(pid: number | undefined): boolean {
   }
 }
 
-function buildBaseState(
-  config: ManagedProxyConfig,
-  owned: boolean,
-): ManagedProxyState {
+function buildBaseState(config: ManagedProxyConfig): ManagedProxyState {
   return {
     provider: config.provider,
     port: config.port,
     rootUrl: config.rootUrl,
     routedBaseUrl: config.routedBaseUrl,
-    owned,
-    status: owned ? "stopped" : "external",
+    status: "stopped",
   };
 }
 
@@ -244,8 +247,10 @@ function saveRoute(config: ManagedProxyConfig): void {
   writeFileSync(path, JSON.stringify(payload, null, 2));
 }
 
-function loadOwner(provider: ManagedProvider): OwnerMetadata | undefined {
-  const raw = readJsonFile<Partial<OwnerMetadata>>(ownerMetadataPath(provider));
+function normalizeServiceMetadata(
+  provider: ManagedProvider,
+  raw: Partial<ServiceMetadata> | undefined,
+): ServiceMetadata | undefined {
   if (
     !raw ||
     raw.provider !== provider ||
@@ -254,6 +259,7 @@ function loadOwner(provider: ManagedProvider): OwnerMetadata | undefined {
   ) {
     return undefined;
   }
+
   return {
     provider,
     pid: raw.pid,
@@ -262,15 +268,28 @@ function loadOwner(provider: ManagedProvider): OwnerMetadata | undefined {
       typeof raw.startedAt === "string"
         ? raw.startedAt
         : new Date().toISOString(),
-    version: typeof raw.version === "number" ? raw.version : METADATA_VERSION,
+    version:
+      typeof raw.version === "number" ? raw.version : METADATA_VERSION,
   };
 }
 
-function saveOwner(config: ManagedProxyConfig, proxy: ManagedProxyState): void {
+function loadServiceMetadata(
+  provider: ManagedProvider,
+): ServiceMetadata | undefined {
+  return normalizeServiceMetadata(
+    provider,
+    readJsonFile<Partial<ServiceMetadata>>(serviceMetadataPath(provider)),
+  );
+}
+
+function saveServiceMetadata(
+  config: ManagedProxyConfig,
+  proxy: ManagedProxyState,
+): void {
   if (!proxy.pid) return;
-  const path = ownerMetadataPath(config.provider);
+  const path = serviceMetadataPath(config.provider);
   mkdirSync(dirname(path), { recursive: true });
-  const payload: OwnerMetadata = {
+  const payload: ServiceMetadata = {
     provider: config.provider,
     pid: proxy.pid,
     port: config.port,
@@ -280,8 +299,95 @@ function saveOwner(config: ManagedProxyConfig, proxy: ManagedProxyState): void {
   writeFileSync(path, JSON.stringify(payload, null, 2));
 }
 
-function clearOwner(provider: ManagedProvider): void {
-  rmSync(ownerMetadataPath(provider), { force: true });
+function clearServiceMetadata(provider: ManagedProvider): void {
+  rmSync(serviceMetadataPath(provider), { force: true });
+}
+
+function normalizeStartLockMetadata(
+  provider: ManagedProvider,
+  raw: Partial<StartLockMetadata> | undefined,
+): StartLockMetadata | undefined {
+  if (
+    !raw ||
+    raw.provider !== provider ||
+    typeof raw.pid !== "number" ||
+    typeof raw.token !== "string" ||
+    typeof raw.acquiredAt !== "string"
+  ) {
+    return undefined;
+  }
+
+  return {
+    provider,
+    pid: raw.pid,
+    token: raw.token,
+    acquiredAt: raw.acquiredAt,
+    version:
+      typeof raw.version === "number" ? raw.version : METADATA_VERSION,
+  };
+}
+
+function readStartLockMetadata(
+  provider: ManagedProvider,
+): StartLockMetadata | undefined {
+  return normalizeStartLockMetadata(
+    provider,
+    readJsonFile<Partial<StartLockMetadata>>(startLockPath(provider)),
+  );
+}
+
+function isStartLockStale(lock: StartLockMetadata): boolean {
+  if (!processAlive(lock.pid)) return true;
+  const acquiredAt = Date.parse(lock.acquiredAt);
+  if (!Number.isFinite(acquiredAt)) return true;
+  return Date.now() - acquiredAt > START_LOCK_STALE_MS;
+}
+
+function releaseStartLock(provider: ManagedProvider, token: string): void {
+  const current = readStartLockMetadata(provider);
+  if (!current || current.token !== token) return;
+  rmSync(startLockPath(provider), { force: true });
+}
+
+async function acquireStartLock(
+  provider: ManagedProvider,
+): Promise<() => void> {
+  const path = startLockPath(provider);
+  mkdirSync(dirname(path), { recursive: true });
+  const token =
+    `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < START_LOCK_WAIT_MS) {
+    const payload: StartLockMetadata = {
+      provider,
+      pid: process.pid,
+      token,
+      acquiredAt: new Date().toISOString(),
+      version: METADATA_VERSION,
+    };
+
+    try {
+      writeFileSync(path, JSON.stringify(payload, null, 2), { flag: "wx" });
+      return () => releaseStartLock(provider, token);
+    } catch (error) {
+      const code =
+        error && typeof error === "object" && "code" in error
+          ? String((error as { code?: unknown }).code ?? "")
+          : "";
+      if (code !== "EEXIST") throw error;
+
+      const current = readStartLockMetadata(provider);
+      if (!current || isStartLockStale(current)) {
+        rmSync(path, { force: true });
+        continue;
+      }
+
+      await sleep(PROBE_INTERVAL_MS);
+    }
+  }
+
+  throw new Error(`Timed out waiting to acquire start lock for ${provider}.`);
 }
 
 function getConfig(provider: ManagedProvider): ManagedProxyConfig {
@@ -403,14 +509,12 @@ async function refreshPerfSummary(
 function activeStatusLine(model: ProviderModel | undefined): string {
   const provider = managedProviderFor(model);
   if (!provider) return "Headroom: off";
-  if (headroomInstallProblem)
-    return `Headroom:${provider} unavailable | pi defaults`;
+  if (headroomInstallProblem) return `Headroom:${provider} unavailable | pi defaults`;
 
   const config = getConfig(provider);
   const proxy = globalState().proxies.get(provider);
   const perf = globalState().perf.get(provider);
   const status = proxy?.status ?? "idle";
-  const owner = proxy?.owned ? "own" : proxy ? "ext" : "?";
   const fallback =
     config.port === config.preferredPort
       ? ""
@@ -426,8 +530,8 @@ function activeStatusLine(model: ProviderModel | undefined): string {
 
   if (status === "failed") return `Headroom:${provider} failed${fallback}`;
   if (status === "starting") return `Headroom:${provider} starting${fallback}`;
-  if (status === "running" || status === "external") {
-    return `Headroom:${provider} ${status}/${owner}${fallback}${perfSuffix}`;
+  if (status === "running") {
+    return `Headroom:${provider} running${fallback}${perfSuffix}`;
   }
   return `Headroom:${provider} ${status}${fallback}${perfSuffix}`;
 }
@@ -481,21 +585,19 @@ function statusLines(model: ProviderModel | undefined): string[] {
     const proxy = state.proxies.get(provider);
     const status = proxy?.status ?? "idle";
     if (status === "idle" || status === "stopped") return [];
-    const ownership = proxy?.owned
-      ? `owned pid=${proxy.pid ?? "?"}`
-      : proxy
-        ? "external"
-        : "unknown";
+
+    const service = proxy?.pid ? `service pid=${proxy.pid}` : "service";
     const error = proxy?.lastError ? ` error=${proxy.lastError}` : "";
     const fallback =
       config.port === config.preferredPort
         ? ""
         : ` fallback-from=${config.preferredPort}`;
     return [
-      `- ${provider}: ${config.routedBaseUrl} [${status}; ${ownership}]${fallback}${error}`,
+      `- ${provider}: ${config.routedBaseUrl} [${status}; ${service}]${fallback}${error}`,
       `  dashboard: ${dashboardUrl(config)}`,
     ];
   });
+
   const activeCount = providerIds().filter((provider) => {
     const status = state.proxies.get(provider)?.status ?? "idle";
     return status !== "idle" && status !== "stopped";
@@ -509,7 +611,7 @@ function statusLines(model: ProviderModel | undefined): string[] {
     `Footer status: ${activeStatusLine(model)}`,
     `Headroom CLI: ${headroomInstallProblem ?? "available"}`,
     `Autostart: ${AUTOSTART ? "enabled" : "disabled"}`,
-    `Shutdown mode: ${SHUTDOWN_MODE}`,
+    "Lifecycle: shared singleton per provider",
     `Port scan limit: ${PORT_SCAN_LIMIT}`,
     `Managed proxies: ${activeCount} active / ${providerIds().length} configured`,
     "Unmanaged providers fall back to pi defaults.",
@@ -627,13 +729,14 @@ async function resolveInitialConfig(
 ): Promise<ManagedProxyConfig> {
   const preferredPort = preferredPortFor(provider);
   const savedRoute = loadRoute(provider);
+  const service = loadServiceMetadata(provider);
   const candidatePorts: number[] = [];
-
   const addCandidate = (port: number | undefined) => {
     if (!port || port <= 0 || candidatePorts.includes(port)) return;
     candidatePorts.push(port);
   };
 
+  addCandidate(service?.port);
   addCandidate(savedRoute?.port);
   addCandidate(preferredPort);
   for (let offset = 1; offset <= PORT_SCAN_LIMIT; offset += 1) {
@@ -643,10 +746,12 @@ async function resolveInitialConfig(
   let preferredOccupied: PortAssessment | undefined;
   for (const port of candidatePorts) {
     const assessment = await assessPort(provider, port);
-    if (
-      assessment.disposition === "headroom" ||
-      assessment.disposition === "free"
-    ) {
+    const isManagedServicePort =
+      assessment.disposition === "headroom" &&
+      !!service &&
+      service.port === port &&
+      processAlive(service.pid);
+    if (assessment.disposition === "free" || isManagedServicePort) {
       saveRoute(assessment.config);
       return assessment.config;
     }
@@ -715,7 +820,7 @@ async function waitForReady(
 }
 
 function markHealthy(proxy: ManagedProxyState): ManagedProxyState {
-  proxy.status = proxy.owned ? "running" : "external";
+  proxy.status = "running";
   proxy.lastHealthyAt = Date.now();
   proxy.lastError = undefined;
   return proxy;
@@ -748,8 +853,7 @@ function spawnProxy(config: ManagedProxyConfig): ManagedProxyState {
     port: config.port,
     rootUrl: config.rootUrl,
     routedBaseUrl: config.routedBaseUrl,
-    owned: true,
-    pid: child.pid,
+        pid: child.pid,
     process: child,
     status: "starting",
   };
@@ -783,32 +887,50 @@ async function resolveKnownState(
   }
 
   const config = getConfig(provider);
-  const owner = loadOwner(provider);
+  const service = loadServiceMetadata(provider);
   const healthy = await probeLiveness(config.rootUrl);
-
   if (
     healthy &&
-    owner &&
-    owner.port === config.port &&
-    processAlive(owner.pid)
+    service &&
+    service.port === config.port &&
+    processAlive(service.pid)
   ) {
-    const owned = markHealthy({
-      ...buildBaseState(config, true),
-      pid: owner.pid,
+    const managed = markHealthy({
+      ...buildBaseState(config),
+      pid: service.pid,
     });
-    state.proxies.set(provider, owned);
-    return owned;
+    state.proxies.set(provider, managed);
+    return managed;
   }
 
-  if (healthy) {
-    const external = markHealthy(buildBaseState(config, false));
-    state.proxies.set(provider, external);
-    if (owner && !processAlive(owner.pid)) clearOwner(provider);
-    return external;
+  if (service && !processAlive(service.pid)) clearServiceMetadata(provider);
+  return undefined;
+}
+
+async function recoverUnhealthyManagedService(
+  provider: ManagedProvider,
+  config: ManagedProxyConfig,
+): Promise<void> {
+  const service = loadServiceMetadata(provider);
+  if (!service) return;
+  if (!processAlive(service.pid)) {
+    clearServiceMetadata(provider);
+    return;
   }
 
-  if (owner && !processAlive(owner.pid)) clearOwner(provider);
-  return cached;
+  const serviceConfig =
+    service.port === config.port
+      ? config
+      : buildManagedProxyConfig(provider, service.port, DEFAULT_HOST);
+  if (await probeLiveness(serviceConfig.rootUrl)) return;
+
+  const proxy = buildBaseState(serviceConfig);
+  proxy.pid = service.pid;
+  proxy.status = "failed";
+  proxy.lastError = "managed service became unhealthy; restarting";
+  await terminateProxy(proxy);
+  globalState().proxies.delete(provider);
+  globalState().perf.delete(provider);
 }
 
 async function ensureProxyRunning(
@@ -830,34 +952,49 @@ async function ensureProxyRunning(
 
     if (!AUTOSTART) {
       throw new Error(
-        `No healthy Headroom proxy for ${provider} at ${config.rootUrl}. Start it manually or enable PI_HEADROOM_AUTOSTART.`,
+        `No healthy managed Headroom proxy for ${provider} at ${config.rootUrl}. Start it manually with this package or enable PI_HEADROOM_AUTOSTART.`,
       );
     }
 
-    const assessment = await assessPort(provider, config.port);
-    if (assessment.disposition === "occupied") {
-      throw new Error(
-        `Selected port ${config.port} for ${provider} is occupied by a non-Headroom service. Reload pi to rescan fallback ports.`,
-      );
-    }
-    if (assessment.disposition === "headroom") {
-      const external = markHealthy(buildBaseState(config, false));
-      state.proxies.set(provider, external);
-      return external;
-    }
-
-    const spawned = spawnProxy(config);
-    state.proxies.set(provider, spawned);
+    const releaseStartLock = await acquireStartLock(provider);
     try {
-      await waitForReady(config, spawned);
-      saveOwner(config, spawned);
-      return spawned;
-    } catch (error) {
-      spawned.status = "failed";
-      spawned.lastError =
-        error instanceof Error ? error.message : String(error);
-      clearOwner(provider);
-      throw error;
+      const lockedKnown = await resolveKnownState(provider);
+      if (
+        lockedKnown &&
+        lockedKnown.status !== "stopped" &&
+        lockedKnown.status !== "failed"
+      ) {
+        return lockedKnown;
+      }
+
+      await recoverUnhealthyManagedService(provider, config);
+
+      const assessment = await assessPort(provider, config.port);
+      if (assessment.disposition !== "free") {
+        const reason =
+          assessment.disposition === "headroom"
+            ? "already has another Headroom proxy"
+            : "is occupied by a non-Headroom service";
+        throw new Error(
+          `Selected port ${config.port} for ${provider} ${reason}. Reload pi to rescan fallback ports or free that port.`,
+        );
+      }
+
+      const spawned = spawnProxy(config);
+      state.proxies.set(provider, spawned);
+      try {
+        await waitForReady(config, spawned);
+        saveServiceMetadata(config, spawned);
+        return spawned;
+      } catch (error) {
+        spawned.status = "failed";
+        spawned.lastError =
+          error instanceof Error ? error.message : String(error);
+        clearServiceMetadata(provider);
+        throw error;
+      }
+    } finally {
+      releaseStartLock();
     }
   })();
 
@@ -870,12 +1007,12 @@ async function ensureProxyRunning(
 }
 
 async function terminateProxy(proxy: ManagedProxyState): Promise<void> {
-  if (!proxy.owned || !proxy.pid) return;
+  if (!proxy.pid) return;
 
   try {
     process.kill(proxy.pid, "SIGTERM");
   } catch {
-    clearOwner(proxy.provider);
+    clearServiceMetadata(proxy.provider);
     proxy.status = "stopped";
     proxy.lastHealthyAt = undefined;
     proxy.process = undefined;
@@ -885,7 +1022,7 @@ async function terminateProxy(proxy: ManagedProxyState): Promise<void> {
   const deadline = Date.now() + 3000;
   while (Date.now() < deadline) {
     if (!(await probeLiveness(proxy.rootUrl))) {
-      clearOwner(proxy.provider);
+      clearServiceMetadata(proxy.provider);
       proxy.status = "stopped";
       proxy.lastHealthyAt = undefined;
       proxy.process = undefined;
@@ -900,44 +1037,10 @@ async function terminateProxy(proxy: ManagedProxyState): Promise<void> {
     // already gone
   }
 
-  clearOwner(proxy.provider);
+  clearServiceMetadata(proxy.provider);
   proxy.status = "stopped";
   proxy.lastHealthyAt = undefined;
   proxy.process = undefined;
-}
-
-async function cleanupOwnedProxies(): Promise<void> {
-  const state = globalState();
-  if (state.cleaningUp) return;
-  state.cleaningUp = true;
-
-  const owned = Array.from(state.proxies.values()).filter(
-    (proxy) => proxy.owned,
-  );
-  await Promise.allSettled(owned.map((proxy) => terminateProxy(proxy)));
-
-  for (const proxy of owned) {
-    state.proxies.delete(proxy.provider);
-    state.pending.delete(proxy.provider);
-  }
-}
-
-function installProcessExitCleanup(): void {
-  if (SHUTDOWN_MODE !== "session") return;
-  const state = globalState();
-  if (state.cleanupInstalled) return;
-  state.cleanupInstalled = true;
-  process.once("exit", () => {
-    for (const proxy of state.proxies.values()) {
-      if (!proxy.owned || !proxy.pid) continue;
-      try {
-        process.kill(proxy.pid, "SIGTERM");
-      } catch {
-        // ignore best-effort exit cleanup
-      }
-      clearOwner(proxy.provider);
-    }
-  });
 }
 
 async function ensureForCurrentModel(
@@ -994,22 +1097,22 @@ function parseProviderArg(
     : undefined;
 }
 
-async function ownedStateFor(
+async function managedStateFor(
   provider: ManagedProvider,
 ): Promise<ManagedProxyState | undefined> {
   const state = globalState();
   const current = state.proxies.get(provider);
-  if (current?.owned) return current;
+  if (current?.pid) return current;
 
-  const owner = loadOwner(provider);
-  if (!owner || !processAlive(owner.pid)) {
-    clearOwner(provider);
+  const service = loadServiceMetadata(provider);
+  if (!service || !processAlive(service.pid)) {
+    clearServiceMetadata(provider);
     return undefined;
   }
 
   const config = getConfig(provider);
-  const proxy = buildBaseState(config, true);
-  proxy.pid = owner.pid;
+  const proxy = buildBaseState(config);
+  proxy.pid = service.pid;
   if (await probeLiveness(config.rootUrl)) {
     markHealthy(proxy);
   }
@@ -1017,6 +1120,7 @@ async function ownedStateFor(
   return proxy;
 }
 
+function registerCommands(pi: ExtensionAPI): void {
 function registerCommands(pi: ExtensionAPI): void {
   pi.registerCommand(STATUS_COMMAND, {
     description: "Show Headroom proxy routing and supervisor status.",
@@ -1035,8 +1139,7 @@ function registerCommands(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand(STOP_COMMAND, {
-    description:
-      "Stop extension-owned Headroom proxies. Usage: /headroom-stop [provider|all]",
+    description: "Stop managed Headroom provider proxies. Usage: /headroom-stop [provider|all]",
     handler: async (args: string, ctx: ExtensionCtx) => {
       if (headroomInstallProblem) {
         updateUiStatus(ctx);
@@ -1064,7 +1167,7 @@ function registerCommands(pi: ExtensionAPI): void {
       const stopped: ManagedProvider[] = [];
 
       for (const provider of providers) {
-        const proxy = await ownedStateFor(provider);
+        const proxy = await managedStateFor(provider);
         if (!proxy) continue;
         await terminateProxy(proxy);
         globalState().proxies.delete(provider);
@@ -1076,16 +1179,15 @@ function registerCommands(pi: ExtensionAPI): void {
       notifyUi(
         ctx,
         stopped.length
-          ? `Stopped Headroom proxy for ${stopped.join(", ")}.`
-          : "No extension-owned Headroom proxy to stop.",
+          ? `Stopped managed Headroom proxy for ${stopped.join(", ")}.`
+          : "No managed Headroom proxy to stop.",
         "info",
       );
     },
   });
 
   pi.registerCommand(RESTART_COMMAND, {
-    description:
-      "Restart extension-owned Headroom proxies. Usage: /headroom-restart [provider|all]",
+    description: "Restart managed Headroom provider proxies. Usage: /headroom-restart [provider|all]",
     handler: async (args: string, ctx: ExtensionCtx) => {
       if (headroomInstallProblem) {
         updateUiStatus(ctx);
@@ -1111,7 +1213,7 @@ function registerCommands(pi: ExtensionAPI): void {
       const providers =
         selected && selected !== "all" ? [selected] : providerIds();
       for (const provider of providers) {
-        const proxy = await ownedStateFor(provider);
+        const proxy = await managedStateFor(provider);
         if (proxy) {
           await terminateProxy(proxy);
           globalState().proxies.delete(provider);
@@ -1124,7 +1226,7 @@ function registerCommands(pi: ExtensionAPI): void {
       updateUiStatus(ctx);
       notifyUi(
         ctx,
-        `Restarted Headroom proxy for ${providers.join(", ")}.`,
+        `Restarted managed Headroom proxy for ${providers.join(", ")}.`,
         "info",
       );
     },
@@ -1136,7 +1238,6 @@ export default async function headroomProviderSupervisor(
 ): Promise<void> {
   headroomInstallProblem = detectHeadroomInstallProblem();
   await initializeConfigs();
-  installProcessExitCleanup();
   if (!headroomInstallProblem) {
     registerManagedProviders(pi, getConfig);
   }
@@ -1202,9 +1303,4 @@ export default async function headroomProviderSupervisor(
     updateUiStatus(ctx, model);
   });
 
-  pi.on("session_shutdown", async (event: SessionShutdownEvent) => {
-    if (SHUTDOWN_MODE !== "session") return;
-    if (event.reason !== "quit") return;
-    await cleanupOwnedProxies();
-  });
 }
