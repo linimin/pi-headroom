@@ -139,6 +139,7 @@ You should see:
 - `xai`
 - `github-copilot`
 - `openai`
+- `openai-codex`
 - `openrouter`
 - `deepseek`
 - `groq`
@@ -199,6 +200,7 @@ Default ports:
 - `xiaomi-token-plan-ams` → `8809`
 - `xiaomi-token-plan-sgp` → `8810`
 - `kimi-coding` → `8811`
+- `openai-codex` → `8812`
 
 ## Commands
 
@@ -270,6 +272,8 @@ Each provider also has optional port/upstream overrides such as:
 
 - `PI_HEADROOM_OPENAI_PORT`
 - `PI_HEADROOM_OPENAI_UPSTREAM`
+- `PI_HEADROOM_OPENAI_CODEX_PORT`
+- `PI_HEADROOM_OPENAI_CODEX_UPSTREAM`
 - `PI_HEADROOM_ANTHROPIC_PORT`
 - `PI_HEADROOM_ANTHROPIC_UPSTREAM`
 - `PI_HEADROOM_OPENROUTER_PORT`
@@ -285,7 +289,6 @@ These pi providers still need more provider-specific handling and are not yet ma
 - `cloudflare-ai-gateway`
 - `cloudflare-workers-ai`
 - `vercel-ai-gateway`
-- `openai-codex`
 - `opencode`
 - `opencode-go`
 - `zai`
